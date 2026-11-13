@@ -120,6 +120,17 @@ func printJSON(j any) error {
 // Verify a token and output the claims.  This is a great example
 // of how to verify and view a token.
 func verifyToken() error {
+	// The algorithm must be specified explicitly and is enforced as a
+	// whitelist during parsing.  Relying on the key type alone is not
+	// sufficient, since the token itself chooses which algorithm (and
+	// thus which key type) it wants to be verified with.
+	if *flagAlg == "" {
+		return fmt.Errorf("flag -alg is required for verification")
+	}
+	if jwt.GetSigningMethod(*flagAlg) == nil {
+		return fmt.Errorf("couldn't find signing method: %v", *flagAlg)
+	}
+
 	// get the token
 	tokData, err := loadData(*flagVerify)
 	if err != nil {
@@ -151,7 +162,7 @@ func verifyToken() error {
 		default:
 			return data, nil
 		}
-	})
+	}, jwt.WithValidMethods([]string{*flagAlg}))
 
 	// Print an error if we can't parse for some reason
 	if err != nil {

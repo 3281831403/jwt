@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -148,6 +149,9 @@ func (p *Parser) ParseUnverified(tokenString string, claims Claims) (token *Toke
 	if headerBytes, err = p.DecodeSegment(parts[0]); err != nil {
 		return token, parts, newError("could not base64 decode header", ErrTokenMalformed, err)
 	}
+	if err = checkJSONObject(headerBytes); err != nil {
+		return token, parts, newError("could not JSON decode header", ErrTokenMalformed, err)
+	}
 	if err = json.Unmarshal(headerBytes, &token.Header); err != nil {
 		return token, parts, newError("could not JSON decode header", ErrTokenMalformed, err)
 	}
@@ -158,6 +162,12 @@ func (p *Parser) ParseUnverified(tokenString string, claims Claims) (token *Toke
 	claimBytes, err := p.DecodeSegment(parts[1])
 	if err != nil {
 		return token, parts, newError("could not base64 decode claim", ErrTokenMalformed, err)
+	}
+
+	// Reject ambiguous claims (non-object payload or duplicate keys) before
+	// decoding them into the concrete claims type below.
+	if err = checkJSONObject(claimBytes); err != nil {
+		return token, parts, newError("could not JSON decode claim", ErrTokenMalformed, err)
 	}
 
 	// If `useJSONNumber` is enabled then we must use *json.Decoder to decode
@@ -202,8 +212,94 @@ func (p *Parser) ParseUnverified(tokenString string, claims Claims) (token *Toke
 	return token, parts, nil
 }
 
-// splitToken splits a token string into three parts: header, claims, and signature. It will only
-// return true if the token contains exactly two delimiters and three parts. In all other cases, it
+// checkJSONObject verifies that data consists of exactly one JSON value and
+// that this value is an object. Additionally, any object at any nesting level
+// must not contain duplicate keys. A token segment that allows more than one
+// interpretation (e.g. a "null" payload silently decoding to empty claims, or
+// a repeated "alg" header where only the last value is effective) is rejected
+// here, so that all claims types and decoder options share the same strict
+// behavior.
+func checkJSONObject(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+
+	// frame tracks one open container. A non-nil keys set denotes an object
+	// and collects the keys seen so far; expectKey is true while the next
+	// token inside an object must be a key (or the closing delimiter).
+	type frame struct {
+		keys      map[string]struct{}
+		expectKey bool
+	}
+	var stack []frame
+	done := false
+
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if done {
+			return errors.New("unexpected data after top-level JSON object")
+		}
+
+		if delim, ok := tok.(json.Delim); ok {
+			switch delim {
+			case '{', '[':
+				if len(stack) == 0 && delim != '{' {
+					return errors.New("top-level JSON value is not an object")
+				}
+				f := frame{}
+				if delim == '{' {
+					f.keys = make(map[string]struct{})
+					f.expectKey = true
+				}
+				stack = append(stack, f)
+			case '}', ']':
+				// The decoder guarantees properly nested delimiters.
+				stack = stack[:len(stack)-1]
+				if len(stack) == 0 {
+					done = true
+				} else {
+					// The closed container was a value of its parent.
+					stack[len(stack)-1].expectKey = true
+				}
+			}
+			continue
+		}
+
+		if len(stack) == 0 {
+			return errors.New("top-level JSON value is not an object")
+		}
+		top := &stack[len(stack)-1]
+		if top.keys == nil {
+			// Array element, no key tracking needed.
+			continue
+		}
+		if top.expectKey {
+			key, ok := tok.(string)
+			if !ok {
+				return errors.New("expected object key")
+			}
+			if _, dup := top.keys[key]; dup {
+				return fmt.Errorf("duplicate key %q in JSON object", key)
+			}
+			top.keys[key] = struct{}{}
+			top.expectKey = false
+		} else {
+			// Scalar object value; the next token is a key again.
+			top.expectKey = true
+		}
+	}
+
+	if !done {
+		return errors.New("unexpected end of JSON input")
+	}
+	return nil
+}
+
+// splitToken splits a token string into three parts: header, claims, and signature. It will only// return true if the token contains exactly two delimiters and three parts. In all other cases, it
 // will return nil parts and false.
 func splitToken(token string) ([]string, bool) {
 	parts := make([]string, 3)

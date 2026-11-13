@@ -3,6 +3,7 @@ package jwt_test
 import (
 	"crypto"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -855,6 +856,87 @@ func TestParser_ParseLineBreaks(t *testing.T) {
 			_, err := jwt.Parse(tt.token, defaultKeyFunc)
 			if !errors.Is(err, jwt.ErrTokenMalformed) {
 				t.Fatalf("expected %v, got %v", jwt.ErrTokenMalformed, err)
+			}
+		})
+	}
+}
+
+func TestParser_ParseStrictJSON(t *testing.T) {
+	encode := func(s string) string {
+		return base64.RawURLEncoding.EncodeToString([]byte(s))
+	}
+	validHeader := `{"alg":"RS256","typ":"JWT"}`
+	validClaims := `{"foo":"bar"}`
+
+	// A token segment must decode to exactly one JSON object and no object at
+	// any nesting level may contain duplicate keys. Everything else is
+	// ambiguous and must be rejected as malformed.
+	malformed := []struct {
+		name   string
+		header string
+		claims string
+	}{
+		{"null header", `null`, validClaims},
+		{"array header", `[]`, validClaims},
+		{"string header", `"HS256"`, validClaims},
+		{"duplicate alg in header", `{"alg":"none","alg":"HS256"}`, validClaims},
+		{"duplicate key in header", `{"alg":"RS256","typ":"JWT","typ":"at+jwt"}`, validClaims},
+		{"null claims", validHeader, `null`},
+		{"empty claims", validHeader, ``},
+		{"array claims", validHeader, `[]`},
+		{"string claims", validHeader, `"foo"`},
+		{"number claims", validHeader, `123`},
+		{"bool claims", validHeader, `true`},
+		{"duplicate sub in claims", validHeader, `{"sub":"alice","sub":"bob"}`},
+		{"duplicate key in nested object", validHeader, `{"a":{"x":1,"x":2}}`},
+		{"duplicate key in object inside array", validHeader, `{"a":[{"x":1,"x":2}]}`},
+		{"second top-level value in claims", validHeader, `{"foo":"bar"} {"foo":"baz"}`},
+	}
+
+	for _, tt := range malformed {
+		t.Run("malformed/"+tt.name, func(t *testing.T) {
+			tokenString := encode(tt.header) + "." + encode(tt.claims) + "." + encode("sig")
+
+			// All parsing entry points and claims types must agree that the
+			// token is malformed.
+			if _, err := jwt.Parse(tokenString, defaultKeyFunc); !errors.Is(err, jwt.ErrTokenMalformed) {
+				t.Errorf("Parse: expected %v, got %v", jwt.ErrTokenMalformed, err)
+			}
+			if _, err := jwt.ParseWithClaims(tokenString, &jwt.RegisteredClaims{}, defaultKeyFunc); !errors.Is(err, jwt.ErrTokenMalformed) {
+				t.Errorf("ParseWithClaims: expected %v, got %v", jwt.ErrTokenMalformed, err)
+			}
+			if _, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{}); !errors.Is(err, jwt.ErrTokenMalformed) {
+				t.Errorf("ParseUnverified: expected %v, got %v", jwt.ErrTokenMalformed, err)
+			}
+			if _, _, err := jwt.NewParser(jwt.WithJSONNumber()).ParseUnverified(tokenString, jwt.MapClaims{}); !errors.Is(err, jwt.ErrTokenMalformed) {
+				t.Errorf("ParseUnverified with WithJSONNumber: expected %v, got %v", jwt.ErrTokenMalformed, err)
+			}
+		})
+	}
+
+	// Keys may repeat across different objects and nesting levels; only
+	// duplicates within the same object are ambiguous.
+	valid := []struct {
+		name   string
+		claims string
+	}{
+		{"same key in nested object", `{"sub":"alice","nested":{"sub":"bob"}}`},
+		{"same key in separate array objects", `{"a":[{"x":1},{"x":2}]}`},
+		{"empty object claims", `{}`},
+	}
+
+	for _, tt := range valid {
+		t.Run("valid/"+tt.name, func(t *testing.T) {
+			tokenString := encode(validHeader) + "." + encode(tt.claims) + "." + encode("sig")
+
+			if _, _, err := new(jwt.Parser).ParseUnverified(tokenString, jwt.MapClaims{}); err != nil {
+				t.Errorf("ParseUnverified: expected no error, got %v", err)
+			}
+			if _, _, err := jwt.NewParser(jwt.WithJSONNumber()).ParseUnverified(tokenString, jwt.MapClaims{}); err != nil {
+				t.Errorf("ParseUnverified with WithJSONNumber: expected no error, got %v", err)
+			}
+			if _, _, err := new(jwt.Parser).ParseUnverified(tokenString, &jwt.RegisteredClaims{}); err != nil {
+				t.Errorf("ParseUnverified with custom claims: expected no error, got %v", err)
 			}
 		})
 	}
